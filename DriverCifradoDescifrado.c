@@ -1,12 +1,13 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/ctype.h>
 #include <linux/cdev.h>
+#include <linux/slab.h>
 #include <linux/fs.h>
 
 #include <linux/crypto.h>
 #include <linux/scatterlist.h>
 #include <crypto/skcipher.h>
-#include <crypto/hash.h>
 
 #define DRIVER_NAME "DriverCifradoDescifrado"
 #define DRIVER_CLASS "DriverCifradoDescifradoClass"
@@ -14,19 +15,57 @@
 #define AES_KEY_SIZE 32
 #define NUM_DEVICES 3
 
-static unsigned char keyAES[AES_KEY_SIZE];
+static unsigned char keyAES[AES_KEY_SIZE + 1];
 
-// Definir buffers globales para almacenamiento
 static char encrypted_data[256 + AES_BLOCK_SIZE];
 static char decrypted_data[256 + AES_BLOCK_SIZE];
 
-// Asumir que tenemos una variable para llevar el tamaño de los datos cifrados/descifrados
 static size_t encrypted_data_size = 0;
 static size_t decrypted_data_size = 0;
 
+static char *bin_to_hex(const unsigned char *bin, size_t len) {
+    char *hex = kmalloc(len * 2 + 1, GFP_KERNEL);
+    if (!hex)
+        return NULL;
+
+    for (size_t i = 0; i < len; ++i) {
+        snprintf(&hex[i * 2], 3, "%02x", bin[i]);
+    }
+
+    hex[len * 2] = '\0';
+    return hex;
+}
+
+static int my_hex_to_bin(const char *hex, unsigned char *bin, size_t bin_len) {
+    int byte;
+    size_t i, j;
+
+    for (i = 0, j = 0; i < bin_len && hex[j] != '\0' && hex[j + 1] != '\0'; ++i, j += 2) {
+        if (sscanf(&hex[j], "%2x", &byte) != 1)
+            return -1;
+        bin[i] = (unsigned char)byte;
+    }
+
+    return i == bin_len ? 0 : -1;
+}
+
 static void generate_aes_key(void) {
-    get_random_bytes(keyAES, AES_KEY_SIZE);
-    pr_info("Clave AES generada: %*phN\n", AES_KEY_SIZE, keyAES);
+    static const char allowed_chars[] =
+            "abcdefghijklmnopqrstuvwxyz"
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            "0123456789"
+            "!@#~$%&/()=?¿¡[]^*{}+-_";
+    size_t allowed_chars_len = sizeof(allowed_chars) - 1;
+
+    for (int i = 0; i < AES_KEY_SIZE; i++) {
+        unsigned int rand_val;
+        get_random_bytes(&rand_val, sizeof(rand_val));
+        keyAES[i] = allowed_chars[rand_val % allowed_chars_len];
+    }
+
+    keyAES[AES_KEY_SIZE] = '\0';
+
+    pr_info("Clave AES generada: %.*s\n", AES_KEY_SIZE, keyAES);
 }
 
 static size_t apply_pkcs7_padding(unsigned char *data, unsigned int data_len, unsigned int buffer_size) {
@@ -51,8 +90,8 @@ static size_t apply_pkcs7_padding(unsigned char *data, unsigned int data_len, un
 static int ECCAESencrypt(const u8 *plaintext, unsigned int plen, u8 *ciphertext) {
     struct crypto_skcipher *skcipher = NULL;
     struct skcipher_request *req = NULL;
-    DECLARE_CRYPTO_WAIT(wait);
-    struct scatterlist src, dst;
+    struct crypto_wait wait;
+    struct scatterlist sg;
     int ret;
 
     if (plen <= 0) {
@@ -73,41 +112,53 @@ static int ECCAESencrypt(const u8 *plaintext, unsigned int plen, u8 *ciphertext)
         goto out_free_skcipher;
     }
 
+    crypto_init_wait(&wait);
+
     if (crypto_skcipher_setkey(skcipher, keyAES, AES_KEY_SIZE)) {
         pr_err("La clave no se pudo configurar.\n");
         ret = -EAGAIN;
         goto out_free_req;
     }
 
-    sg_init_one(&src, plaintext, plen);
-    sg_init_one(&dst, ciphertext, plen);
-    skcipher_request_set_crypt(req, &src, &dst, plen, NULL);
+    sg_init_one(&sg, plaintext, plen);
+    skcipher_request_set_crypt(req, &sg, &sg, plen, NULL);
+    skcipher_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG, crypto_req_done, &wait);
 
-    pr_info("Iniciando cifrado. Texto plano: %*phN\n", plen, plaintext);
-    pr_info("Se va a usar la clave AES: %*phN\n", AES_KEY_SIZE, keyAES);
+    pr_info("Iniciando cifrado. Texto plano: %.*s\n", plen, plaintext);
+    pr_info("Se va a usar la clave AES: %.*s\n", AES_KEY_SIZE, keyAES);
     ret = crypto_wait_req(crypto_skcipher_encrypt(req), &wait);
     if (ret) {
         pr_err("Error durante el cifrado: %d\n", ret);
         goto out_free_req;
     } else {
         encrypted_data_size = plen;
-        pr_info("Cifrado exitoso. Datos cifrados: %*phN\n", encrypted_data_size, ciphertext);
+        memcpy(ciphertext, sg_virt(&sg), plen);
+    }
+
+    char *hex_encrypted_data = bin_to_hex(sg_virt(&sg), plen);
+    if (hex_encrypted_data) {
+        strncpy(encrypted_data, hex_encrypted_data, sizeof(encrypted_data) - 1);
+        encrypted_data_size = strlen(hex_encrypted_data);
+        pr_info("Cifrado exitoso. Datos cifrados en hexadecimal: %s\n", hex_encrypted_data);
+        kfree(hex_encrypted_data);
+    } else {
+        pr_err("Error al convertir los datos cifrados a hexadecimal.\n");
     }
 
     ret = 0;
 
     out_free_req:
-    skcipher_request_free(req);
+		skcipher_request_free(req);
     out_free_skcipher:
-    crypto_free_skcipher(skcipher);
+		crypto_free_skcipher(skcipher);
     return ret;
 }
 
 static int ECCAESdesencrypt(const u8 *ciphertext, unsigned int clen, u8 *plaintext) {
     struct crypto_skcipher *skcipher = NULL;
     struct skcipher_request *req = NULL;
-    DECLARE_CRYPTO_WAIT(wait);
-    struct scatterlist src, dst;
+    struct crypto_wait wait;
+    struct scatterlist sg;
     int ret = 0;
 
     if (clen <= 0) {
@@ -134,27 +185,38 @@ static int ECCAESdesencrypt(const u8 *ciphertext, unsigned int clen, u8 *plainte
         goto out_free_req;
     }
 
-    sg_init_one(&src, ciphertext, clen);
-    sg_init_one(&dst, plaintext, clen);
-    skcipher_request_set_crypt(req, &src, &dst, clen, NULL);
+    unsigned char *binary_data = kmalloc(clen / 2, GFP_KERNEL); // Asumiendo que 'clen' es la longitud de los datos hexadecimales
+    if (binary_data) {
+        if (my_hex_to_bin(ciphertext, binary_data, clen / 2) == 0) {
+            sg_init_one(&sg, binary_data, clen / 2);
+            skcipher_request_set_crypt(req, &sg, &sg, clen / 2, NULL);
+            skcipher_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG, crypto_req_done, &wait);
 
-    pr_info("Iniciando descifrado. Texto cifrado: %*phN\n", clen, ciphertext);
-    pr_info("Se va a usar la clave AES: %*phN\n", AES_KEY_SIZE, keyAES);
-    ret = crypto_wait_req(crypto_skcipher_decrypt(req), &wait);
-    if (ret) {
-        pr_err("Error durante el descifrado: %d\n", ret);
-        goto out_free_req;
+            pr_info("Iniciando descifrado. Texto cifrado: %.*s\n", clen, ciphertext);
+            pr_info("Se va a usar la clave AES: %.*s\n", AES_KEY_SIZE, keyAES);
+            ret = crypto_wait_req(crypto_skcipher_decrypt(req), &wait);
+            if (ret) {
+                pr_err("Error durante el descifrado: %d\n", ret);
+                goto out_free_req;
+            } else {
+                decrypted_data_size = clen;
+                memcpy(plaintext, sg_virt(&sg), clen);
+                pr_info("Descifrado exitoso. Datos descifrados: %.*s\n", decrypted_data_size, plaintext);
+            }
+        } else {
+            pr_err("Error al convertir los datos de hexadecimal a binario.\n");
+        }
+        kfree(binary_data);
     } else {
-        decrypted_data_size = clen;
-        pr_info("Descifrado exitoso. Datos descifrados: %*phN\n", encrypted_data_size, plaintext);
+        pr_err("Error al asignar memoria para los datos binarios.\n");
     }
 
     ret = 0;
 
     out_free_req:
-    skcipher_request_free(req);
+		skcipher_request_free(req);
     out_free_skcipher:
-    crypto_free_skcipher(skcipher);
+		crypto_free_skcipher(skcipher);
     return ret;
 }
 
@@ -196,7 +258,7 @@ static ssize_t ECCread(struct file *file, char __user *buffer, size_t count, lof
                 return 0;
             }
             data_size = min(count, encrypted_data_size);
-            pr_info("Mensaje cifrado: %*phN\n", encrypted_data_size, encrypted_data);
+            pr_info("Mensaje cifrado: %.*s\n", encrypted_data_size, encrypted_data);
             if (copy_to_user(buffer, encrypted_data, data_size)) {
                 return -EFAULT;
             }
@@ -209,7 +271,7 @@ static ssize_t ECCread(struct file *file, char __user *buffer, size_t count, lof
                 return 0;
             }
             data_size = min(count, decrypted_data_size);
-            pr_info("Mensaje descifrado: %*phN\n", decrypted_data_size, decrypted_data);
+            pr_info("Mensaje descifrado: %.*s\n", decrypted_data_size, decrypted_data);
             if (copy_to_user(buffer, decrypted_data, data_size)) {
                 return -EFAULT;
             }
@@ -230,15 +292,18 @@ static ssize_t ECCwrite(struct file *file, const char __user *buffer, size_t cou
         return -EFAULT;
     }
 
+
     if (count > 256) {
         pr_err("El mensaje es demasiado largo.\n");
         return -EINVAL;
     }
 
-    new_count = apply_pkcs7_padding(data_buffer, count, sizeof(data_buffer));
-    if (new_count == 0) {
-        pr_err("Falló la aplicación del padding.\n");
-        return -EINVAL;
+    if(minor == 1) {
+        new_count = apply_pkcs7_padding(data_buffer, count, sizeof(data_buffer));
+        if (new_count == 0) {
+            pr_err("Falló la aplicación del padding.\n");
+            return -EINVAL;
+        }
     }
 
 
@@ -253,7 +318,7 @@ static ssize_t ECCwrite(struct file *file, const char __user *buffer, size_t cou
                 return -EFAULT;
             }
 
-            pr_info("Clave AES establecida con éxito: %*phN\n", AES_KEY_SIZE, keyAES);
+            pr_info("Clave AES establecida con exito: %.*s\n", AES_KEY_SIZE, keyAES);
             break;
         case 1:
             result = ECCAESencrypt(data_buffer, new_count, encrypted_data);
@@ -264,7 +329,7 @@ static ssize_t ECCwrite(struct file *file, const char __user *buffer, size_t cou
             }
             break;
         case 2:
-            result = ECCAESdesencrypt(data_buffer, new_count, decrypted_data);
+            result = ECCAESdesencrypt(data_buffer, count, decrypted_data);
             if (decrypted_data_size > 0) {
                 pr_info("Mensaje descifrado correctamente. Tamanio de datos descifrados: %zu.\n", decrypted_data_size);
             } else {
