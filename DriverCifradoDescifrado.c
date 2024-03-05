@@ -185,7 +185,7 @@ static int ECCAESdesencrypt(const u8 *ciphertext, unsigned int clen, u8 *plainte
         goto out_free_req;
     }
 
-    unsigned char *binary_data = kmalloc(clen / 2, GFP_KERNEL); // Asumiendo que 'clen' es la longitud de los datos hexadecimales
+    unsigned char *binary_data = kmalloc(clen / 2, GFP_KERNEL); 
     if (binary_data) {
         if (my_hex_to_bin(ciphertext, binary_data, clen / 2) == 0) {
             sg_init_one(&sg, binary_data, clen / 2);
