@@ -1,4 +1,3 @@
-<![CDATA[<!-- Badges Dinámicos -->
 <div align="center">
 
 # 🔐 DriverCifradoDescifrado
@@ -778,4 +777,3 @@ MODULE_LICENSE("GPL");
 *Desarrollado con 🔐 para la comunidad de sistemas embebidos y seguridad informática*
 
 </div>
-]]>
